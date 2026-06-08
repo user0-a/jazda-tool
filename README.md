@@ -152,6 +152,46 @@ integers (not timestamps). Both repos are Maven Spring Boot projects, so the
 `pom.xml` `<version>` conflict is covered by `HigherSemverRule` and the
 JS-oriented `PreferMainForLockfilesRule` is inert (safe to delete).
 
+## Feature-owned files (`pvt`)
+
+Files listed under `git.keep-ours-paths` (default: `pvt`) always keep the feature
+branch's version, no matter what main did:
+
+- On conflict (both branches changed it), `KeepFeatureVersionRule` takes the
+  feature side.
+- With no conflict (only main changed it, so git would silently take main's
+  version), a post-merge step restores the file from `origin/<branch>` — the
+  feature tip — so the feature version wins unconditionally.
+
+Add more such files in `application.yml`:
+
+```yaml
+git:
+  keep-ours-paths:
+    - pvt
+    - config/local.env
+```
+
+### Optional version bump (`currentVersionUpgrade`)
+
+Send `currentVersionUpgrade=true` in the request to rewrite a version marker line
+in the version file (default `pvt`) to **main's** version with its last segment
+incremented by one:
+
+```json
+{ "branch": "my-feature", "currentVersionUpgrade": true }
+```
+
+If main's `pvt` has `// currentVersion: 3.4.2313`, the feature branch's `pvt`
+marker line becomes `// currentVersion: 3.4.2314`. The rest of `pvt` stays the
+feature's version. Off by default. Configure the file and marker:
+
+```yaml
+git:
+  version-file: pvt
+  version-marker-prefix: "// currentVersion:"
+```
+
 ## Assumptions I made
 
 - **REST endpoint** as the input mechanism (vs. a CLI). Easy to swap.

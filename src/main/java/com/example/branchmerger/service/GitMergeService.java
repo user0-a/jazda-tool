@@ -8,17 +8,26 @@ import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.ResetCommand.ResetType;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.Ref;
+import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.merge.MergeStrategy;
+import org.eclipse.jgit.revwalk.RevCommit;
+import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.transport.CredentialsProvider;
 import org.eclipse.jgit.transport.RefSpec;
 import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
+import org.eclipse.jgit.treewalk.TreeWalk;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Service
 public class GitMergeService {
@@ -42,6 +51,15 @@ public class GitMergeService {
      * {@code main} into it, and pushes the result.
      */
     public MergeResult mergeMainInto(String targetBranch) {
+        return mergeMainInto(targetBranch, false);
+    }
+
+    /**
+     * @param currentVersionUpgrade when true, rewrites the version marker line in the
+     *        version file (default {@code pvt}) to main's version with its last segment
+     *        incremented by one.
+     */
+    public MergeResult mergeMainInto(String targetBranch, boolean currentVersionUpgrade) {
         String remote = props.getRemote();
         String mainBranch = props.getMainBranch();
         CredentialsProvider cp = credentials();
@@ -99,7 +117,7 @@ public class GitMergeService {
 
                 case FAST_FORWARD:
                 case MERGED:
-                    normalizeMigrations(git, plan, targetBranch);
+                    normalizeMigrations(git, plan, targetBranch, currentVersionUpgrade);
                     push(git, targetBranch, remote, cp);
                     MergeResult ok = MergeResult.of(MergeResult.Status.MERGED_AND_PUSHED, targetBranch,
                             "Merged " + mainBranch + " into " + targetBranch
@@ -113,7 +131,8 @@ public class GitMergeService {
                     return ok;
 
                 case CONFLICTING:
-                    return handleConflicts(git, targetBranch, remote, cp, merge, plan);
+                    return handleConflicts(git, targetBranch, remote, cp, merge, plan,
+                            currentVersionUpgrade);
 
                 default:
                     abort(git);
@@ -131,7 +150,8 @@ public class GitMergeService {
     private MergeResult handleConflicts(Git git, String targetBranch, String remote,
                                         CredentialsProvider cp,
                                         org.eclipse.jgit.api.MergeResult merge,
-                                        MigrationPlan plan) throws Exception {
+                                        MigrationPlan plan,
+                                        boolean currentVersionUpgrade) throws Exception {
 
         List<String> conflicting = new ArrayList<>();
         if (merge.getConflicts() != null) {
@@ -147,7 +167,7 @@ public class GitMergeService {
                     .setMessage("Merge " + props.getRemote() + "/" + props.getMainBranch()
                             + " into " + targetBranch + " (conflicts auto-resolved)")
                     .call();
-            normalizeMigrations(git, plan, targetBranch);
+            normalizeMigrations(git, plan, targetBranch, currentVersionUpgrade);
             push(git, targetBranch, remote, cp);
             MergeResult r = MergeResult.of(MergeResult.Status.MERGED_AND_PUSHED, targetBranch,
                     "Conflicts auto-resolved, merged and pushed.");
@@ -163,14 +183,156 @@ public class GitMergeService {
         return r;
     }
 
-    /** Applies the migration/rollback renumbering and commits it if anything changed. */
-    private void normalizeMigrations(Git git, MigrationPlan plan, String targetBranch) throws Exception {
-        if (migrationNormalizer.apply(git, plan)) {
-            git.commit()
-                    .setMessage("Renumber migration to " + props.getMigrationPrefix() + plan.newNumber()
-                            + " and reset rollback after merging "
-                            + props.getMainBranch() + " into " + targetBranch)
-                    .call();
+    /** Renumbers migrations, forces feature-owned files, optionally bumps the version; commits if changed. */
+    private void normalizeMigrations(Git git, MigrationPlan plan, String targetBranch,
+                                     boolean currentVersionUpgrade) throws Exception {
+        boolean changed = migrationNormalizer.apply(git, plan);
+        changed |= restoreFeatureFiles(git, targetBranch);
+        if (currentVersionUpgrade) {
+            changed |= upgradeCurrentVersion(git, targetBranch);
+        }
+        if (changed) {
+            StringBuilder msg = new StringBuilder("Post-merge normalization after merging "
+                    + props.getMainBranch() + " into " + targetBranch);
+            if (plan.hasMigration()) {
+                msg.append(" (migration renumbered to ").append(props.getMigrationPrefix())
+                        .append(plan.newNumber()).append(")");
+            }
+            git.commit().setMessage(msg.toString()).call();
+        }
+    }
+
+    /**
+     * Rewrites the version marker line in the version file to main's version with its
+     * last numeric segment incremented by one. E.g. main has "// currentVersion: 3.4.2313"
+     * -> the feature file's marker becomes "// currentVersion: 3.4.2314". The rest of the
+     * file (kept as the feature's version) is untouched.
+     *
+     * @return true if the file was changed and staged
+     */
+    private boolean upgradeCurrentVersion(Git git, String branch) throws Exception {
+        Repository repo = git.getRepository();
+        String versionFile = props.getVersionFile();
+
+        // Main's current version.
+        ObjectId mainId = repo.resolve(props.getRemote() + "/" + props.getMainBranch());
+        if (mainId == null) {
+            return false;
+        }
+        String mainContent;
+        try (RevWalk walk = new RevWalk(repo)) {
+            byte[] bytes = blobAt(repo, walk.parseCommit(mainId), versionFile);
+            if (bytes == null) {
+                return false;
+            }
+            mainContent = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+        }
+
+        Matcher mainMatcher = versionLinePattern().matcher(mainContent);
+        if (!mainMatcher.find()) {
+            log.warn("currentVersionUpgrade requested but no version marker found in {} on {}",
+                    versionFile, props.getMainBranch());
+            return false;
+        }
+        String newVersion = incrementLastSegment(mainMatcher.group(2));
+
+        // Rewrite the marker line in the feature file (already restored to the feature version).
+        Path file = repo.getWorkTree().toPath().resolve(versionFile);
+        if (!Files.exists(file)) {
+            return false;
+        }
+        String featureContent = Files.readString(file);
+        Matcher featureMatcher = versionLinePattern().matcher(featureContent);
+        if (!featureMatcher.find()) {
+            log.warn("No version marker in feature {} to upgrade", versionFile);
+            return false;
+        }
+        String updated = featureMatcher.replaceFirst("$1" + Matcher.quoteReplacement(newVersion));
+        if (updated.equals(featureContent)) {
+            return false;
+        }
+        Files.writeString(file, updated);
+        git.add().addFilepattern(versionFile).call();
+        log.info("Upgraded version marker in {} to {}", versionFile, newVersion);
+        return true;
+    }
+
+    /** Group 1 = marker prefix + whitespace, group 2 = version number. */
+    private Pattern versionLinePattern() {
+        return Pattern.compile("(" + Pattern.quote(props.getVersionMarkerPrefix())
+                + "\\s*)([0-9]+(?:\\.[0-9]+)*)");
+    }
+
+    private String incrementLastSegment(String version) {
+        String[] parts = version.split("\\.");
+        try {
+            long last = Long.parseLong(parts[parts.length - 1]);
+            parts[parts.length - 1] = Long.toString(last + 1);
+        } catch (NumberFormatException e) {
+            return version; // last segment not numeric; leave as-is
+        }
+        return String.join(".", parts);
+    }
+
+    /**
+     * Forces the configured feature-owned files (e.g. pvt) to the feature branch's
+     * pre-merge content, so main can never overwrite them. origin/&lt;branch&gt; still
+     * points at the feature tip throughout the local merge, so it is the source of truth.
+     *
+     * @return true if any file was changed and staged
+     */
+    private boolean restoreFeatureFiles(Git git, String branch) throws Exception {
+        List<String> paths = props.getKeepOursPaths();
+        if (paths == null || paths.isEmpty()) {
+            return false;
+        }
+        Repository repo = git.getRepository();
+        ObjectId featureTip = repo.resolve(props.getRemote() + "/" + branch);
+        if (featureTip == null) {
+            featureTip = repo.resolve(branch);
+        }
+        if (featureTip == null) {
+            return false;
+        }
+
+        boolean changed = false;
+        try (RevWalk walk = new RevWalk(repo)) {
+            RevCommit tip = walk.parseCommit(featureTip);
+            for (String path : paths) {
+                byte[] featureContent = blobAt(repo, tip, path);
+                Path workFile = repo.getWorkTree().toPath().resolve(path);
+                boolean tracked = repo.readDirCache().findEntry(path) >= 0;
+
+                if (featureContent == null) {
+                    // Feature doesn't have the file -> keeping "feature version" means removing it.
+                    if (tracked) {
+                        git.rm().addFilepattern(path).call();
+                        changed = true;
+                    }
+                    continue;
+                }
+
+                byte[] current = Files.exists(workFile) ? Files.readAllBytes(workFile) : null;
+                if (current == null || !Arrays.equals(current, featureContent)) {
+                    if (workFile.getParent() != null) {
+                        Files.createDirectories(workFile.getParent());
+                    }
+                    Files.write(workFile, featureContent);
+                    git.add().addFilepattern(path).call();
+                    changed = true;
+                    log.info("Kept feature-branch version of {}", path);
+                }
+            }
+        }
+        return changed;
+    }
+
+    private byte[] blobAt(Repository repo, RevCommit commit, String path) throws Exception {
+        try (TreeWalk tw = TreeWalk.forPath(repo, path, commit.getTree())) {
+            if (tw == null) {
+                return null;
+            }
+            return repo.open(tw.getObjectId(0)).getBytes();
         }
     }
 

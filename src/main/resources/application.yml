@@ -3,13 +3,25 @@ server:
 
 git:
   # Absolute path to a local clone of the repo on this machine.
-  repo-path: ${GIT_REPO_PATH:/path/to/local/clone}
+  repo-path: path
   remote: origin
   main-branch: main
   # For GitHub, use a Personal Access Token. The username can be your GitHub
   # username or "x-access-token". Prefer providing the token via env var.
-  username: ${GIT_USERNAME:x-access-token}
-  token: ${GIT_TOKEN:}
+  username: x-access-token
+  token: token
+
+  # Migration handling (defaults shown).
+  migrations-dir: migrations
+  rollback-dir: migration-rollback
+  migration-prefix: V
+  migration-suffix: .sql
+  # Files whose feature-branch version is always kept, even if main changed them.
+  keep-ours-paths:
+    - pvt
+  # Optional currentVersionUpgrade (per-request flag) rewrites this marker in this file.
+  version-file: pvt
+  version-marker-prefix: "// currentVersion:"
 
 logging:
   level:

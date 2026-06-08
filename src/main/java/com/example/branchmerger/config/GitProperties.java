@@ -2,6 +2,8 @@ package com.example.branchmerger.config;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
+import java.util.List;
+
 /**
  * Configuration bound from the "git" prefix in application.yml
  * (or overridden via env vars, e.g. GIT_TOKEN).
@@ -35,6 +37,18 @@ public class GitProperties {
 
     /** Filename suffix, e.g. ".sql". */
     private String migrationSuffix = ".sql";
+
+    /**
+     * Repo-relative paths whose feature-branch version is always kept, no matter
+     * what main did (conflict or not). Defaults to the "pvt" file at the repo root.
+     */
+    private List<String> keepOursPaths = List.of("pvt");
+
+    /** File holding the version marker that the optional currentVersionUpgrade rewrites. */
+    private String versionFile = "pvt";
+
+    /** Marker that precedes the version number on its line. */
+    private String versionMarkerPrefix = "// currentVersion:";
 
     public String getRepoPath() {
         return repoPath;
@@ -106,5 +120,29 @@ public class GitProperties {
 
     public void setMigrationSuffix(String migrationSuffix) {
         this.migrationSuffix = migrationSuffix;
+    }
+
+    public List<String> getKeepOursPaths() {
+        return keepOursPaths;
+    }
+
+    public void setKeepOursPaths(List<String> keepOursPaths) {
+        this.keepOursPaths = keepOursPaths;
+    }
+
+    public String getVersionFile() {
+        return versionFile;
+    }
+
+    public void setVersionFile(String versionFile) {
+        this.versionFile = versionFile;
+    }
+
+    public String getVersionMarkerPrefix() {
+        return versionMarkerPrefix;
+    }
+
+    public void setVersionMarkerPrefix(String versionMarkerPrefix) {
+        this.versionMarkerPrefix = versionMarkerPrefix;
     }
 }

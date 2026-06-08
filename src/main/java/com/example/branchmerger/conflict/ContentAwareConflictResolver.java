@@ -91,33 +91,42 @@ public class ContentAwareConflictResolver implements ConflictResolver {
         String baseFileText = new String(base, StandardCharsets.UTF_8);
         StringBuilder out = new StringBuilder();
 
-        String pendingOursText = null;
-        List<String> pendingOursLines = null;
+        // Accumulate each conflict region's sides. A region may have zero, one, or
+        // several chunks per side, and the "ours" side can be empty (no FIRST chunk),
+        // so we buffer until the region ends (next NO_CONFLICT chunk or end of file).
+        boolean inConflict = false;
+        StringBuilder oursText = new StringBuilder();
+        StringBuilder theirsText = new StringBuilder();
+        List<String> oursLines = new ArrayList<>();
+        List<String> theirsLines = new ArrayList<>();
 
         for (MergeChunk chunk : mr) {
             RawText seq = seqs[chunk.getSequenceIndex()];
-            String text = seq.getString(chunk.getBegin(), chunk.getEnd(), false);
+            String text = textOf(seq, chunk.getBegin(), chunk.getEnd());
             ConflictState state = chunk.getConflictState();
 
             if (state == ConflictState.NO_CONFLICT) {
+                if (inConflict) {
+                    if (!flushConflict(path, baseFileText, oursText, theirsText,
+                            oursLines, theirsLines, out)) {
+                        return false;
+                    }
+                    inConflict = false;
+                }
                 out.append(text);
             } else if (state == ConflictState.FIRST_CONFLICTING_RANGE) {
-                // "ours" side of a conflict region
-                pendingOursText = text;
-                pendingOursLines = linesOf(seq, chunk.getBegin(), chunk.getEnd());
-            } else { // NEXT_CONFLICTING_RANGE -> "theirs" side; now we have both
-                List<String> theirsLines = linesOf(seq, chunk.getBegin(), chunk.getEnd());
-                ConflictHunk hunk = new ConflictHunk(
-                        path, pendingOursText, text, pendingOursLines, theirsLines, baseFileText);
-
-                Optional<String> resolved = applyRules(hunk);
-                if (resolved.isEmpty()) {
-                    return false; // no rule handled this hunk
-                }
-                out.append(resolved.get());
-                pendingOursText = null;
-                pendingOursLines = null;
+                inConflict = true;
+                oursText.append(text);
+                oursLines.addAll(linesOf(seq, chunk.getBegin(), chunk.getEnd()));
+            } else { // NEXT_CONFLICTING_RANGE -> "theirs" side
+                inConflict = true;
+                theirsText.append(text);
+                theirsLines.addAll(linesOf(seq, chunk.getBegin(), chunk.getEnd()));
             }
+        }
+        if (inConflict && !flushConflict(path, baseFileText, oursText, theirsText,
+                oursLines, theirsLines, out)) {
+            return false;
         }
 
         // Write resolved content and stage it (clears the conflict / index stages).
@@ -125,6 +134,29 @@ public class ContentAwareConflictResolver implements ConflictResolver {
                 out.toString().getBytes(StandardCharsets.UTF_8));
         git.add().addFilepattern(path).call();
         log.info("Resolved conflicts in {}", path);
+        return true;
+    }
+
+    /**
+     * Applies the rules to one accumulated conflict region and appends the result.
+     * Returns false if no rule resolved it. Clears the buffers for the next region.
+     */
+    private boolean flushConflict(String path, String baseFileText,
+                                  StringBuilder oursText, StringBuilder theirsText,
+                                  List<String> oursLines, List<String> theirsLines,
+                                  StringBuilder out) {
+        ConflictHunk hunk = new ConflictHunk(path, oursText.toString(), theirsText.toString(),
+                new ArrayList<>(oursLines), new ArrayList<>(theirsLines), baseFileText);
+        Optional<String> resolved = applyRules(hunk);
+        // Reset buffers regardless, ready for the next region.
+        oursText.setLength(0);
+        theirsText.setLength(0);
+        oursLines.clear();
+        theirsLines.clear();
+        if (resolved.isEmpty()) {
+            return false;
+        }
+        out.append(resolved.get());
         return true;
     }
 
@@ -163,10 +195,23 @@ public class ContentAwareConflictResolver implements ConflictResolver {
     }
 
     private List<String> linesOf(RawText rt, int begin, int end) {
-        List<String> lines = new ArrayList<>(end - begin);
+        List<String> lines = new ArrayList<>(Math.max(0, end - begin));
         for (int i = begin; i < end; i++) {
             lines.add(rt.getString(i)); // line content without terminator
         }
         return lines;
+    }
+
+    /**
+     * Builds the text for a chunk line by line using the single-arg getString(i),
+     * which is safe for empty sequences and edge ranges (the 3-arg getString throws
+     * on an empty base, e.g. add/add conflicts). Output is LF-terminated.
+     */
+    private String textOf(RawText rt, int begin, int end) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = begin; i < end; i++) {
+            sb.append(rt.getString(i)).append('\n');
+        }
+        return sb.toString();
     }
 }

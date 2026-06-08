@@ -27,7 +27,8 @@ public class MergeController {
      */
     @PostMapping("/merge")
     public ResponseEntity<MergeResult> merge(@Valid @RequestBody MergeRequest request) {
-        MergeResult result = gitMergeService.mergeMainInto(request.getBranch().trim());
+        MergeResult result = gitMergeService.mergeMainInto(
+                request.getBranch().trim(), request.isCurrentVersionUpgrade());
 
         HttpStatus status = switch (result.getStatus()) {
             case MERGED_AND_PUSHED, ALREADY_UP_TO_DATE -> HttpStatus.OK;
