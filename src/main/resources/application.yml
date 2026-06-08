@@ -1,0 +1,17 @@
+server:
+  port: 8080
+
+git:
+  # Absolute path to a local clone of the repo on this machine.
+  repo-path: ${GIT_REPO_PATH:/path/to/local/clone}
+  remote: origin
+  main-branch: main
+  # For GitHub, use a Personal Access Token. The username can be your GitHub
+  # username or "x-access-token". Prefer providing the token via env var.
+  username: ${GIT_USERNAME:x-access-token}
+  token: ${GIT_TOKEN:}
+
+logging:
+  level:
+    com.example.branchmerger: INFO
+    org.eclipse.jgit: WARN
